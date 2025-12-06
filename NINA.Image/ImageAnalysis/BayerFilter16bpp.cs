@@ -26,6 +26,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Media.TextFormatting;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace NINA.Image.ImageAnalysis {
     public sealed class BayerFilter16bpp : BayerFilter {
@@ -93,11 +94,6 @@ namespace NINA.Image.ImageAnalysis {
         }
         ";
 
-        /// <summary>
-        /// 0.0 = CPU only; 1.0 = GPU handles all inner rows.
-        /// </summary>
-        private double GpuRatio { get; set; } = 0.6666;
-
         public bool SaveColorChannels { get; set; }
         public bool SaveLumChannel { get; set; }
 
@@ -149,6 +145,11 @@ namespace NINA.Image.ImageAnalysis {
             if (SaveColorChannels || SaveLumChannel) {
                 ExtractLrgba(dstPtr, width, height);
             }
+
+#if DEBUG
+            // 2) Verify result against reference implementation
+            VerifyReference(sourceData, destinationData);
+#endif
         }
 
         private void InitLRGBArrays(int pixelCount) {
@@ -218,19 +219,6 @@ namespace NINA.Image.ImageAnalysis {
             int p10 = BayerPattern[1, 0];
             int p11 = BayerPattern[1, 1];
             int[] flatPattern = { p00, p01, p10, p11 };
-
-            double ratio = Math.Clamp(GpuRatio, 0.0, 1.0);
-
-            bool hasMultiGpu = multiDeviceExecutor != null && multiDeviceExecutor.GpuWorkerCount > 0;
-            bool useGpu = ratio > 0.0 && hasMultiGpu;
-
-            if (!useGpu) {
-                // pure CPU
-                Parallel.For(innerStartY, innerEndY, y =>
-                    ProcessRowCpu(y, width, srcPtr, dstPtr, srcStride, flatPattern));
-                ProcessBorders(width, height, srcPtr, dstPtr, srcStride);
-                return;
-            }
 
             // CPU worker delegate (bottom strip)
             Action<int, int> cpuWorker = (startY, endY) =>
@@ -321,6 +309,57 @@ namespace NINA.Image.ImageAnalysis {
             acc.ReadBufferRegion(dstBuf, startElem, dstSpan);
         }
 
+        private struct ColumnAccum {
+                public int s0, s1, s2;   // sums for channels 0,1,2
+                public int c0, c1, c2;   // counts for channels 0,1,2
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void Acc(ref ColumnAccum col, int ch, ushort v) {
+            // ch is pat[...] value: 0,1,2
+            switch (ch) {
+                case 0:
+                    col.s0 += v; col.c0++; break;
+                case 1:
+                    col.s1 += v; col.c1++; break;
+                default:
+                    col.s2 += v; col.c2++; break;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private unsafe static void InitColumn(
+            ref ColumnAccum col,
+            ushort* rowTop,
+            ushort* rowMid,
+            ushort* rowBot,
+            int x,
+            int[] pat,
+            int baseTop,
+            int baseMid,
+            int baseBot) {
+            // reset accumulators
+            col.s0 = col.s1 = col.s2 = 0;
+            col.c0 = col.c1 = col.c2 = 0;
+
+            int xp = x & 1;
+
+            // top
+            ushort v = rowTop[x];
+            int ch = pat[baseTop + xp];
+            Acc(ref col, ch, v);
+
+            // middle
+            v = rowMid[x];
+            ch = pat[baseMid + xp];
+            Acc(ref col, ch, v);
+
+            // bottom
+            v = rowBot[x];
+            ch = pat[baseBot + xp];
+            Acc(ref col, ch, v);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private unsafe void ProcessRowCpu(
             int y,
@@ -329,64 +368,61 @@ namespace NINA.Image.ImageAnalysis {
             ushort* dstBase,
             int srcStride,
             int[] pat) {
-
             int widthM1 = width - 1;
 
-            ushort* src = srcBase + y * srcStride + 1;
+            // Pointers to the three rows around y
+            ushort* rowTop = srcBase + (y - 1) * srcStride;
+            ushort* rowMid = srcBase + y * srcStride;
+            ushort* rowBot = srcBase + (y + 1) * srcStride;
+
+            // Row parity bases for Bayer pattern
+            int baseTop = ((y - 1) & 1) << 1;   // (yTop & 1) * 2
+            int baseMid = (y & 1) << 1;
+            int baseBot = ((y + 1) & 1) << 1;
+
+            // Destination pointer: first inner pixel (x = 1)
             ushort* dst = dstBase + (y * width + 1) * 3;
 
-            int[] rgbValues = new int[3];
-            int[] rgbCounters = new int[3];
+            // Column accumulators for x-1, x, x+1
+            ColumnAccum colL = default, colC = default, colR = default, tmp = default;
 
-            for (int x = 1; x < widthM1; x++, src++, dst += 3) {
-                rgbValues[0] = rgbValues[1] = rgbValues[2] = 0;
-                rgbCounters[0] = rgbCounters[1] = rgbCounters[2] = 0;
+            // Initial window centered at x = 1 → columns 0,1,2
+            InitColumn(ref colL, rowTop, rowMid, rowBot, 0, pat, baseTop, baseMid, baseBot);
+            InitColumn(ref colC, rowTop, rowMid, rowBot, 1, pat, baseTop, baseMid, baseBot);
+            InitColumn(ref colR, rowTop, rowMid, rowBot, 2, pat, baseTop, baseMid, baseBot);
 
-                // center
-                int cIdx = pat[(y & 1) * 2 + (x & 1)];
-                rgbValues[cIdx] += *src;
-                rgbCounters[cIdx]++;
+            // Temporary arrays for final sums/counts per channel
+            int[] sums = new int[3];
+            int[] counts = new int[3];
 
-                // left/right
-                int idxL = pat[(y & 1) * 2 + ((x - 1) & 1)];
-                rgbValues[idxL] += src[-1];
-                rgbCounters[idxL]++;
+            // Process inner pixels x = 1 .. width-2
+            for (int x = 1; x < widthM1; x++, dst += 3) {
+                // Sum the 3x3 window = sum of three columns
+                sums[0] = colL.s0 + colC.s0 + colR.s0;
+                sums[1] = colL.s1 + colC.s1 + colR.s1;
+                sums[2] = colL.s2 + colC.s2 + colR.s2;
 
-                int idxR = pat[(y & 1) * 2 + ((x + 1) & 1)];
-                rgbValues[idxR] += src[1];
-                rgbCounters[idxR]++;
+                counts[0] = colL.c0 + colC.c0 + colR.c0;
+                counts[1] = colL.c1 + colC.c1 + colR.c1;
+                counts[2] = colL.c2 + colC.c2 + colR.c2;
 
-                // top row
-                int yTop = (y - 1) & 1;
-                int idxT = pat[yTop * 2 + (x & 1)];
-                rgbValues[idxT] += src[-srcStride];
-                rgbCounters[idxT]++;
+                // Use RGB enum indices, same as original code
+                dst[RGB.R] = (ushort)(sums[RGB.R] / counts[RGB.R]);
+                dst[RGB.G] = (ushort)(sums[RGB.G] / counts[RGB.G]);
+                dst[RGB.B] = (ushort)(sums[RGB.B] / counts[RGB.B]);
 
-                int idxTL = pat[yTop * 2 + ((x - 1) & 1)];
-                rgbValues[idxTL] += src[-srcStride - 1];
-                rgbCounters[idxTL]++;
+                // Slide window horizontally, except after last pixel
+                if (x + 1 < widthM1) {
+                    int newX = x + 2; // new right column at x+2
 
-                int idxTR = pat[yTop * 2 + ((x + 1) & 1)];
-                rgbValues[idxTR] += src[-srcStride + 1];
-                rgbCounters[idxTR]++;
+                    // L <- C, C <- R, R <- new column
+                    tmp = colL;
+                    colL = colC;
+                    colC = colR;
 
-                // bottom row
-                int yBot = (y + 1) & 1;
-                int idxB = pat[yBot * 2 + (x & 1)];
-                rgbValues[idxB] += src[srcStride];
-                rgbCounters[idxB]++;
-
-                int idxBL = pat[yBot * 2 + ((x - 1) & 1)];
-                rgbValues[idxBL] += src[srcStride - 1];
-                rgbCounters[idxBL]++;
-
-                int idxBR = pat[yBot * 2 + ((x + 1) & 1)];
-                rgbValues[idxBR] += src[srcStride + 1];
-                rgbCounters[idxBR]++;
-
-                dst[RGB.R] = (ushort)(rgbValues[RGB.R] / rgbCounters[RGB.R]);
-                dst[RGB.G] = (ushort)(rgbValues[RGB.G] / rgbCounters[RGB.G]);
-                dst[RGB.B] = (ushort)(rgbValues[RGB.B] / rgbCounters[RGB.B]);
+                    InitColumn(ref tmp, rowTop, rowMid, rowBot, newX, pat, baseTop, baseMid, baseBot);
+                    colR = tmp;
+                }
             }
         }
 
@@ -462,6 +498,136 @@ namespace NINA.Image.ImageAnalysis {
                     }
                 }
             });
+        }
+
+        [Conditional("DEBUG")]
+        private unsafe void VerifyReference(UnmanagedImage sourceData, UnmanagedImage destinationData) {
+            // get width and height
+            int width = sourceData.Width;
+            int height = sourceData.Height;
+
+            int widthM1 = width - 1;
+            int heightM1 = height - 1;
+
+            int srcStride = sourceData.Stride / 2;
+
+            int srcOffset = (srcStride - width) / 2;
+            int dstOffset = (destinationData.Stride - width * 6) / 6;
+
+            ushort* src = (ushort*)sourceData.ImageData.ToPointer();
+            ushort* dst = (ushort*)destinationData.ImageData.ToPointer();
+
+            int[] rgbValues = new int[3];
+            int[] rgbCounters = new int[3];
+
+            if (!PerformDemosaicing) {
+                // for each line
+                for (int y = 0; y < height; y++) {
+                    // for each pixel
+                    for (int x = 0; x < width; x++, src++, dst += 3) {
+                        ushort expR = 0, expG = 0, expB = 0;
+
+                        int chan = BayerPattern[y & 1, x & 1];
+                        if (chan == RGB.R) expR = *src;
+                        else if (chan == RGB.G) expG = *src;
+                        else expB = *src;
+
+                        Debug.Assert(dst[RGB.R] == expR &&
+                                     dst[RGB.G] == expG &&
+                                     dst[RGB.B] == expB,
+                            $"Bayer reference mismatch at ({x},{y})");
+                    }
+
+                    src += srcOffset;
+                    dst += dstOffset;
+                }
+            } else {
+                int counter = 0; // kept for structure parity with original, not used
+
+                // for each line
+                for (int y = 0; y < height; y++) {
+                    // for each pixel
+                    for (int x = 0; x < width; x++, src++, dst += 3) {
+                        rgbValues[0] = rgbValues[1] = rgbValues[2] = 0;
+                        rgbCounters[0] = rgbCounters[1] = rgbCounters[2] = 0;
+
+                        int bayerIndex = BayerPattern[y & 1, x & 1];
+
+                        rgbValues[bayerIndex] += *src;
+                        rgbCounters[bayerIndex]++;
+
+                        if (x != 0) {
+                            bayerIndex = BayerPattern[y & 1, (x - 1) & 1];
+
+                            rgbValues[bayerIndex] += src[-1];
+                            rgbCounters[bayerIndex]++;
+                        }
+
+                        if (x != widthM1) {
+                            bayerIndex = BayerPattern[y & 1, (x + 1) & 1];
+
+                            rgbValues[bayerIndex] += src[1];
+                            rgbCounters[bayerIndex]++;
+                        }
+
+                        if (y != 0) {
+                            bayerIndex = BayerPattern[(y - 1) & 1, x & 1];
+
+                            rgbValues[bayerIndex] += src[-srcStride];
+                            rgbCounters[bayerIndex]++;
+
+                            if (x != 0) {
+                                bayerIndex = BayerPattern[(y - 1) & 1, (x - 1) & 1];
+
+                                rgbValues[bayerIndex] += src[-srcStride - 1];
+                                rgbCounters[bayerIndex]++;
+                            }
+
+                            if (x != widthM1) {
+                                bayerIndex = BayerPattern[(y - 1) & 1, (x + 1) & 1];
+
+                                rgbValues[bayerIndex] += src[-srcStride + 1];
+                                rgbCounters[bayerIndex]++;
+                            }
+                        }
+
+                        if (y != heightM1) {
+                            bayerIndex = BayerPattern[(y + 1) & 1, x & 1];
+
+                            rgbValues[bayerIndex] += src[srcStride];
+                            rgbCounters[bayerIndex]++;
+
+                            if (x != 0) {
+                                bayerIndex = BayerPattern[(y + 1) & 1, (x - 1) & 1];
+
+                                rgbValues[bayerIndex] += src[srcStride - 1];
+                                rgbCounters[bayerIndex]++;
+                            }
+
+                            if (x != widthM1) {
+                                bayerIndex = BayerPattern[(y + 1) & 1, (x + 1) & 1];
+
+                                rgbValues[bayerIndex] += src[srcStride + 1];
+                                rgbCounters[bayerIndex]++;
+                            }
+                        }
+
+                        ushort expR = (ushort)(rgbValues[RGB.R] / rgbCounters[RGB.R]);
+                        ushort expG = (ushort)(rgbValues[RGB.G] / rgbCounters[RGB.G]);
+                        ushort expB = (ushort)(rgbValues[RGB.B] / rgbCounters[RGB.B]);
+
+                        Debug.Assert(dst[RGB.R] == expR &&
+                                     dst[RGB.G] == expG &&
+                                     dst[RGB.B] == expB,
+                            $"Demosaic reference mismatch at ({x},{y})");
+
+                        counter++;
+                    }
+
+                    src += srcOffset;
+                    dst += dstOffset;
+                }
+            }
         }
     }
 }

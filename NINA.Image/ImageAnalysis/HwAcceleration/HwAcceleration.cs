@@ -643,7 +643,7 @@ namespace NINA.Image.ImageAnalysis.HwAcceleration {
     /// Public API is application-agnostic: it only knows about width/height and row ranges.
     /// </summary>
     public sealed class MultiDevice2DExecutor : IDisposable {
-        private const int PerfWindowSize = 3;
+        private const int PerfWindowSize = 5;
 
         private sealed class GpuWorker : IDisposable {
             public OpenClAccelerator Accelerator { get; }
@@ -735,8 +735,6 @@ namespace NINA.Image.ImageAnalysis.HwAcceleration {
         private readonly WorkerPerf _cpuPerf;
         private readonly object _perfLock = new object();
 
-        private readonly bool _includeCpuWorker = true;
-
         public int GpuWorkerCount => _gpuWorkers.Count;
 
         public MultiDevice2DExecutor(
@@ -826,7 +824,6 @@ namespace NINA.Image.ImageAnalysis.HwAcceleration {
             int srcStride,   // in ushorts
             Action<int, int>? cpuWorker,
             Action<OpenClAccelerator, ClKernel, ClBuffer, ClBuffer, int, int> gpuWorker) {
-
             if (gpuWorker == null)
                 throw new ArgumentNullException(nameof(gpuWorker));
 
@@ -837,34 +834,19 @@ namespace NINA.Image.ImageAnalysis.HwAcceleration {
 
             int innerRows = innerEndY - innerStartY;
 
-            int gpuCount = _gpuWorkers.Count;
-            bool useCpu = _includeCpuWorker && cpuWorker != null;
-            int workerCount = gpuCount + (useCpu ? 1 : 0);
+            int totalSrcElements = srcStride * height;   // ushort elements
+            int totalDstElements = width * height * 3;   // ushort elements
 
-            // CPU-only fallback
-            if (workerCount == 0) {
-                cpuWorker?.Invoke(innerStartY, innerEndY);
-                return;
-            }
-
-            int baseRows = innerRows / workerCount;
-            int remainder = innerRows % workerCount;
+            // ----- AUTOTUNE: build weights and row distribution -----
+            double[] weights = BuildWorkerWeights(_gpuWorkers.Count);
+            int[] rowsPerWorker = ComputeRowDistribution(innerRows, weights);
 
             int currentY = innerStartY;
-
-            int totalSrcElements = srcStride * height;      // ushort elements
-            int totalDstElements = width * height * 3;      // ushort elements
-
-            var tasks = new List<Task>(workerCount);
+            var tasks = new List<Task>(_gpuWorkers.Count + 1);
 
             // 1) GPU workers (each with its own buffers)
-            for (int i = 0; i < gpuCount; i++) {
-                int rows = baseRows;
-                if (remainder > 0) {
-                    rows++;
-                    remainder--;
-                }
-
+            for (int i = 0; i < _gpuWorkers.Count; i++) {
+                int rows = rowsPerWorker[i];
                 if (rows <= 0)
                     continue;
 
@@ -873,48 +855,71 @@ namespace NINA.Image.ImageAnalysis.HwAcceleration {
                 currentY = endY;
 
                 var worker = _gpuWorkers[i];
+                int workerIndex = i;
+                int localRows = rows;
+                int localStartY = startY;
+                int localEndY = endY;
 
                 tasks.Add(Task.Run(() => {
-                    try {
-                        // allocate/resize once per worker if needed
-                        EnsureBuffersForWorker(worker, totalSrcElements, totalDstElements);
+                    using (MyStopWatch.Measure($"GPUWorker{workerIndex} -> {(double)localRows / innerRows:P1}")) {
+                        var sw = Stopwatch.StartNew();
+                        try {
+                            // allocate/resize once per worker if needed
+                            EnsureBuffersForWorker(worker, totalSrcElements, totalDstElements);
 
-                        // upload full source frame into this worker's src buffer
-                        var srcSpan = new ReadOnlySpan<ushort>(srcPtr, totalSrcElements);
-                        worker.Accelerator.WriteBuffer(worker.SrcBuffer, srcSpan);
+                            // upload full source frame into this worker's src buffer
+                            var srcSpan = new ReadOnlySpan<ushort>(srcPtr, totalSrcElements);
+                            worker.Accelerator.WriteBuffer(worker.SrcBuffer, srcSpan);
 
-                        // call app kernel callback with this worker's buffers
-                        gpuWorker(worker.Accelerator, worker.Kernel, worker.SrcBuffer, worker.DstBuffer, startY, endY);
-                    } catch (Exception ex) {
-                        Logger.Warning($"MultiDevice2DExecutor GPU worker {i} failed: {ex.Message}");
-                        throw;
+                            // run kernel on [localStartY, localEndY)
+                            gpuWorker(worker.Accelerator,
+                                      worker.Kernel,
+                                      worker.SrcBuffer,
+                                      worker.DstBuffer,
+                                      localStartY,
+                                      localEndY);
+                        } catch (Exception ex) {
+                            Logger.Warning($"MultiDevice2DExecutor GPU worker {workerIndex} failed: {ex.Message}");
+                            throw;
+                        } finally {
+                            sw.Stop();
+                            UpdateGpuPerf(workerIndex, localRows, sw.Elapsed.TotalSeconds);
+                        }
                     }
                 }));
             }
 
-            // 2) CPU worker: last chunk
-            if (useCpu) {
-                int rows = baseRows;
-                if (remainder > 0) {
-                    rows++;
-                    remainder--;
-                }
+            // 2) CPU worker: last “worker slot”
+            {
+                int cpuIndex = _gpuWorkers.Count;
+                int rows = rowsPerWorker[cpuIndex];
 
                 if (rows > 0) {
                     int startY = currentY;
                     int endY = startY + rows;
+                    int localRows = rows;
+                    int localStartY = startY;
+                    int localEndY = endY;
 
-                    tasks.Add(Task.Run(() => cpuWorker!(startY, endY)));
+                    tasks.Add(Task.Run(() => {
+                        using (MyStopWatch.Measure($"CPUWorker -> {(double)localRows / innerRows:P1}")) {
+                            var sw = Stopwatch.StartNew();
+                            try {
+                                cpuWorker!(localStartY, localEndY);
+                            } finally {
+                                sw.Stop();
+                                UpdateCpuPerf(localRows, sw.Elapsed.TotalSeconds);
+                            }
+                        }
+                    }));
                 }
             }
 
             Task.WaitAll(tasks);
         }
 
-        private double[] BuildWorkerWeights(int gpuCount, bool useCpu) {
-            int workerCount = gpuCount + (useCpu ? 1 : 0);
-            var weights = new double[workerCount];
-
+        private double[] BuildWorkerWeights(int gpuCount) {
+            var weights = new double[gpuCount + 1];
             lock (_perfLock) {
                 for (int i = 0; i < gpuCount; i++) {
                     double rps = _gpuPerf[i].EstimatedRowsPerSecond;
@@ -922,7 +927,7 @@ namespace NINA.Image.ImageAnalysis.HwAcceleration {
                     weights[i] = rps > 0 ? rps : 1.0;
                 }
 
-                if (useCpu) {
+                {
                     double rps = _cpuPerf.EstimatedRowsPerSecond;
                     weights[gpuCount] = rps > 0 ? rps : 1.0;
                 }
