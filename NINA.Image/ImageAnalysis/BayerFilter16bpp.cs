@@ -35,8 +35,6 @@ namespace NINA.Image.ImageAnalysis {
             FormatTranslations[
                 System.Drawing.Imaging.PixelFormat.Format16bppGrayScale] =
                 System.Drawing.Imaging.PixelFormat.Format48bppRgb;
-
-            InitAccelerator();
         }
 
         private const string KernelSource = @"
@@ -99,31 +97,11 @@ namespace NINA.Image.ImageAnalysis {
 
         public LRGBArrays LRGBArrays { get; private set; }
 
-        private OpenClAccelerator accelerator = OpenClAccelerator.Instance;
-
         // New: multi-device executor
-        private static MultiDevice2DExecutor? multiDeviceExecutor;
-
-        private void InitAccelerator() {
-            // Multi-device executor
-            if (multiDeviceExecutor == null) {
-                try {
-                    var exec = new MultiDevice2DExecutor(
+        private static MultiDevice2DExecutor multiDeviceExecutor = new MultiDevice2DExecutor(
                         KernelSource,
                         "debayer_3x3_inner",
                         maxDevices: -1);
-
-                    if (exec.GpuWorkerCount > 0) {
-                        multiDeviceExecutor = exec;
-                    } else {
-                        exec.Dispose();
-                    }
-                } catch (Exception ex) {
-                    Logger.Warning($"OpenCL multi-device init failed: {ex.Message}");
-                    multiDeviceExecutor = null;
-                }
-            }
-        }
 
         protected override unsafe void ProcessFilter(UnmanagedImage sourceData, UnmanagedImage destinationData) {
             int width = sourceData.Width;
@@ -226,7 +204,7 @@ namespace NINA.Image.ImageAnalysis {
                     ProcessRowCpu(y, width, srcPtr, dstPtr, srcStride, flatPattern));
 
             // GPU worker delegate using per-worker buffers
-            multiDeviceExecutor!.Execute(
+            multiDeviceExecutor.Execute(
                 width: width,
                 height: height,
                 borderTop: 1,
