@@ -27,6 +27,11 @@ namespace NINA.Test {
 
         public ImageDataFactoryTestUtility() {
             this.ProfileServiceMock = new Mock<IProfileService>();
+            var profileMock = new Mock<IProfile>();
+            var cameraSettingsMock = new Mock<ICameraSettings>();
+            cameraSettingsMock.SetupGet(x => x.ASCOMCreate32BitData).Returns(false);
+            profileMock.SetupGet(p => p.CameraSettings).Returns(cameraSettingsMock.Object);
+            this.ProfileServiceMock.SetupGet(ps => ps.ActiveProfile).Returns(profileMock.Object);
             this.StarAnnotatorMock = new Mock<IStarAnnotator>();
             this.StarAnnotatorSelectorMock = new Mock<IPluggableBehaviorSelector<IStarAnnotator>>();
             this.StarAnnotatorSelectorMock.Setup(x => x.GetBehavior()).Returns(this.StarAnnotatorMock.Object);
