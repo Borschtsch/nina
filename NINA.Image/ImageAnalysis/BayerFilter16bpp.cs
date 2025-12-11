@@ -14,27 +14,20 @@
 
 using Accord.Imaging;
 using Accord.Imaging.Filters;
-using ILGPU.Algorithms;
 using NINA.Core.Utility;
 using NINA.Image.ImageAnalysis.HwAcceleration;
 using NINA.Image.ImageData;
-using Silk.NET.OpenCL;
 using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Threading.Tasks;
-using System.Windows.Media.TextFormatting;
-using System.Collections.Generic;
-using System.Diagnostics;
 
 namespace NINA.Image.ImageAnalysis {
     public sealed class BayerFilter16bpp : BayerFilter {
 
         public BayerFilter16bpp() {
             FormatTranslations[
-                System.Drawing.Imaging.PixelFormat.Format16bppGrayScale] =
-                System.Drawing.Imaging.PixelFormat.Format48bppRgb;
+                System.Drawing.Imaging.PixelFormat.Format16bppGrayScale] = System.Drawing.Imaging.PixelFormat.Format48bppRgb;
         }
 
         private const string KernelSource = @"
@@ -186,48 +179,47 @@ namespace NINA.Image.ImageAnalysis {
             int height,
             int srcStride) {
 
-            int innerStartY = 1;
-            int innerEndY = height - 1;
-            int innerRows = innerEndY - innerStartY;
-            if (innerRows <= 0)
-                return;
+            using (MyStopWatch.Measure()) {
+                int innerStartY = 1;
+                int innerEndY = height - 1;
 
-            int p00 = BayerPattern[0, 0];
-            int p01 = BayerPattern[0, 1];
-            int p10 = BayerPattern[1, 0];
-            int p11 = BayerPattern[1, 1];
-            int[] flatPattern = { p00, p01, p10, p11 };
+                int p00 = BayerPattern[0, 0];
+                int p01 = BayerPattern[0, 1];
+                int p10 = BayerPattern[1, 0];
+                int p11 = BayerPattern[1, 1];
+                int[] flatPattern = { p00, p01, p10, p11 };
 
-            // CPU worker delegate (bottom strip)
-            Action<int, int> cpuWorker = (startY, endY) =>
-                Parallel.For(startY, endY, y =>
-                    ProcessRowCpu(y, width, srcPtr, dstPtr, srcStride, flatPattern));
+                // CPU worker delegate (bottom strip)
+                Action<int, int> cpuWorker = (startY, endY) =>
+                    Parallel.For(startY, endY, y =>
+                        ProcessRowCpu(y, width, srcPtr, dstPtr, srcStride, flatPattern));
 
-            // GPU worker delegate using per-worker buffers
-            multiDeviceExecutor.Execute(
-                width: width,
-                height: height,
-                borderTop: 1,
-                borderBottom: 1,
-                srcPtr: srcPtr,
-                dstPtr: dstPtr,
-                srcStride: srcStride,
-                cpuWorker: cpuWorker,
-                gpuWorker: (acc, kernel, srcBuf, dstBuf, startY, endY) =>
-                    ProcessStripOnAccelerator(
-                        acc,
-                        kernel,
-                        srcBuf,
-                        dstBuf,
-                        dstPtr,
-                        width,
-                        height,
-                        srcStride,
-                        startY,
-                        endY,
-                        flatPattern));
+                // GPU worker delegate using per-worker buffers
+                multiDeviceExecutor.Execute(
+                    width: width,
+                    height: height,
+                    borderTop: 1,
+                    borderBottom: 1,
+                    srcPtr: srcPtr,
+                    dstPtr: dstPtr,
+                    srcStride: srcStride,
+                    cpuWorker: cpuWorker,
+                    gpuWorker: (acc, kernel, srcBuf, dstBuf, startY, endY) =>
+                        ProcessStripOnAccelerator(
+                            acc,
+                            kernel,
+                            srcBuf,
+                            dstBuf,
+                            dstPtr,
+                            width,
+                            height,
+                            srcStride,
+                            startY,
+                            endY,
+                            flatPattern));
 
-            ProcessBorders(width, height, srcPtr, dstPtr, srcStride);
+                ProcessBorders(width, height, srcPtr, dstPtr, srcStride);
+            }
         }
 
         /// <summary>
@@ -346,8 +338,6 @@ namespace NINA.Image.ImageAnalysis {
             ushort* dstBase,
             int srcStride,
             int[] pat) {
-            int widthM1 = width - 1;
-
             // Pointers to the three rows around y
             ushort* rowTop = srcBase + (y - 1) * srcStride;
             ushort* rowMid = srcBase + y * srcStride;
@@ -364,17 +354,18 @@ namespace NINA.Image.ImageAnalysis {
             // Column accumulators for x-1, x, x+1
             ColumnAccum colL = default, colC = default, colR = default, tmp = default;
 
-            // Initial window centered at x = 1 → columns 0,1,2
+            // Seed the sliding 3x3 window centered at x = 1 using columns 0, 1, 2
             InitColumn(ref colL, rowTop, rowMid, rowBot, 0, pat, baseTop, baseMid, baseBot);
             InitColumn(ref colC, rowTop, rowMid, rowBot, 1, pat, baseTop, baseMid, baseBot);
             InitColumn(ref colR, rowTop, rowMid, rowBot, 2, pat, baseTop, baseMid, baseBot);
 
-            // Temporary arrays for final sums/counts per channel
-            int[] sums = new int[3];
-            int[] counts = new int[3];
+            // Temporary arrays for final sums/counts per channel (stack) to avoid heap allocations
+            int* sums = stackalloc int[3];
+            int* counts = stackalloc int[3];
 
-            // Process inner pixels x = 1 .. width-2
-            for (int x = 1; x < widthM1; x++, dst += 3) {
+            int lastInnerX = width - 2;
+
+            for (int x = 1; x < lastInnerX; x++, dst += 3) {
                 // Sum the 3x3 window = sum of three columns
                 sums[0] = colL.s0 + colC.s0 + colR.s0;
                 sums[1] = colL.s1 + colC.s1 + colR.s1;
@@ -389,19 +380,29 @@ namespace NINA.Image.ImageAnalysis {
                 dst[RGB.G] = (ushort)(sums[RGB.G] / counts[RGB.G]);
                 dst[RGB.B] = (ushort)(sums[RGB.B] / counts[RGB.B]);
 
-                // Slide window horizontally, except after last pixel
-                if (x + 1 < widthM1) {
-                    int newX = x + 2; // new right column at x+2
+                // Slide window horizontally by reusing two columns and refreshing the rightmost one
+                int newX = x + 2; // new right column at x+2
 
-                    // L <- C, C <- R, R <- new column
-                    tmp = colL;
-                    colL = colC;
-                    colC = colR;
+                tmp = colL;
+                colL = colC;
+                colC = colR;
 
-                    InitColumn(ref tmp, rowTop, rowMid, rowBot, newX, pat, baseTop, baseMid, baseBot);
-                    colR = tmp;
-                }
+                InitColumn(ref tmp, rowTop, rowMid, rowBot, newX, pat, baseTop, baseMid, baseBot);
+                colR = tmp;
             }
+
+            // Process the final inner pixel at x = lastInnerX
+            sums[0] = colL.s0 + colC.s0 + colR.s0;
+            sums[1] = colL.s1 + colC.s1 + colR.s1;
+            sums[2] = colL.s2 + colC.s2 + colR.s2;
+
+            counts[0] = colL.c0 + colC.c0 + colR.c0;
+            counts[1] = colL.c1 + colC.c1 + colR.c1;
+            counts[2] = colL.c2 + colC.c2 + colR.c2;
+
+            dst[RGB.R] = (ushort)(sums[RGB.R] / counts[RGB.R]);
+            dst[RGB.G] = (ushort)(sums[RGB.G] / counts[RGB.G]);
+            dst[RGB.B] = (ushort)(sums[RGB.B] / counts[RGB.B]);
         }
 
         private unsafe void ProcessBorders(
@@ -411,6 +412,7 @@ namespace NINA.Image.ImageAnalysis {
             ushort* dstBase,
             int srcStride) {
 
+            // Handles edge pixels that do not have a full 3x3 neighborhood; kept out of the main loop.
             void ProcessPixel(int x, int y) {
                 ushort* src = srcBase + y * srcStride + x;
                 ushort* dst = dstBase + (y * width + x) * 3;
