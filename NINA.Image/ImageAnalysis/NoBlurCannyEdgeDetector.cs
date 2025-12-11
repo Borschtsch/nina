@@ -1,7 +1,7 @@
 #region "copyright"
 
 /*
-    Copyright © 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
+    Copyright ï¿½ 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
 
     This file is part of N.I.N.A. - Nighttime Imaging 'N' Astronomy.
 
@@ -16,6 +16,8 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Buffers;
+using System.Threading.Tasks;
 using Accord.Imaging;
 using Accord.Imaging.Filters;
 
@@ -116,8 +118,8 @@ namespace NINA.Image.ImageAnalysis {
             double orientation, toAngle = 180.0 / System.Math.PI;
             float leftPixel = 0, rightPixel = 0;
 
-            // orientation array
-            byte[] orients = new byte[width * height];
+            // orientation array (pooled to avoid per-frame allocations)
+            byte[] orients = ArrayPool<byte>.Shared.Rent(width * height);
             // gradients array
             float[,] gradients = new float[source.Width, source.Height];
             float maxGradient = float.NegativeInfinity;
@@ -127,25 +129,30 @@ namespace NINA.Image.ImageAnalysis {
             // allign pointer
             src += srcStride * startY + startX;
 
-            // STEP 1 - calculate magnitude and edge orientation
-            int p = 0;
-
+            // STEP 1 - calculate magnitude and edge orientation (parallelized per row, pooled buffers)
+            object maxLock = new object();
             // for each line
-            for (int y = startY; y < stopY; y++) {
-                // for each pixel
-                for (int x = startX; x < stopX; x++, src++, p++) {
-                    gx = src[-srcStride + 1] + src[srcStride + 1]
-                       - src[-srcStride - 1] - src[srcStride - 1]
-                       + 2 * (src[1] - src[-1]);
+            Parallel.For(startY, stopY, y => {
+                byte* localSrc = src + (y - startY) * srcStride;
+                int localPBase = (y - startY) * width;
+                float localMax = float.NegativeInfinity;
 
-                    gy = src[-srcStride - 1] + src[-srcStride + 1]
-                       - src[srcStride - 1] - src[srcStride + 1]
-                       + 2 * (src[-srcStride] - src[srcStride]);
+                for (int x = startX; x < stopX; x++, localSrc++) {
+                    int idx = localPBase + (x - startX);
+
+                    gx = localSrc[-srcStride + 1] + localSrc[srcStride + 1]
+                       - localSrc[-srcStride - 1] - localSrc[srcStride - 1]
+                       + 2 * (localSrc[1] - localSrc[-1]);
+
+                    gy = localSrc[-srcStride - 1] + localSrc[-srcStride + 1]
+                       - localSrc[srcStride - 1] - localSrc[srcStride + 1]
+                       + 2 * (localSrc[-srcStride] - localSrc[srcStride]);
 
                     // get gradient value
-                    gradients[x, y] = (float)Math.Sqrt(gx * gx + gy * gy);
-                    if (gradients[x, y] > maxGradient)
-                        maxGradient = gradients[x, y];
+                    float g = (float)Math.Sqrt(gx * gx + gy * gy);
+                    gradients[x, y] = g;
+                    if (g > localMax)
+                        localMax = g;
 
                     // --- get orientation
                     if (gx == 0) {
@@ -176,24 +183,30 @@ namespace NINA.Image.ImageAnalysis {
                     }
 
                     // save orientation
-                    orients[p] = (byte)orientation;
+                    orients[idx] = (byte)orientation;
                 }
-                src += srcOffset;
-            }
 
-            // STEP 2 - suppres non maximums
+                lock (maxLock) {
+                    if (localMax > maxGradient) {
+                        maxGradient = localMax;
+                    }
+                }
+            });
+
+            // STEP 2 - suppress non maximums (parallel per row; uses orientations computed above)
             byte* dst = (byte*)destination.ImageData.ToPointer();
             // allign pointer
             dst += dstStride * startY + startX;
 
-            p = 0;
-
             // for each line
-            for (int y = startY; y < stopY; y++) {
-                // for each pixel
-                for (int x = startX; x < stopX; x++, dst++, p++) {
+            Parallel.For(startY, stopY, y => {
+                byte* rowDst = dst + (y - startY) * dstStride;
+                int pBase = (y - startY) * width;
+
+                for (int x = startX; x < stopX; x++, rowDst++) {
+                    int idx = pBase + (x - startX);
                     // get two adjacent pixels
-                    switch (orients[p]) {
+                    switch (orients[idx]) {
                         case 0:
                             leftPixel = gradients[x - 1, y];
                             rightPixel = gradients[x + 1, y];
@@ -209,20 +222,19 @@ namespace NINA.Image.ImageAnalysis {
                             rightPixel = gradients[x, y - 1];
                             break;
 
-                        case 135:
+                        default: // 135
                             leftPixel = gradients[x + 1, y + 1];
                             rightPixel = gradients[x - 1, y - 1];
                             break;
                     }
                     // compare current pixels value with adjacent pixels
                     if ((gradients[x, y] < leftPixel) || (gradients[x, y] < rightPixel)) {
-                        *dst = 0;
+                        *rowDst = 0;
                     } else {
-                        *dst = (byte)(gradients[x, y] / maxGradient * 255);
+                        *rowDst = (byte)(gradients[x, y] / maxGradient * 255);
                     }
                 }
-                dst += dstOffset;
-            }
+            });
 
             // STEP 3 - hysteresis
             dst = (byte*)destination.ImageData.ToPointer();
@@ -262,6 +274,9 @@ namespace NINA.Image.ImageAnalysis {
 
             // release blurred image
             source.Dispose();
+
+            // Return rented buffers
+            ArrayPool<byte>.Shared.Return(orients);
         }
     }
 }
