@@ -1,7 +1,7 @@
 #region "copyright"
 
 /*
-    Copyright � 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
+    Copyright © 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
 
     This file is part of N.I.N.A. - Nighttime Imaging 'N' Astronomy.
 
@@ -13,90 +13,57 @@
 #endregion "copyright"
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.Buffers;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 using Accord.Imaging;
 using Accord.Imaging.Filters;
 
 namespace NINA.Image.ImageAnalysis {
 
-    public class NoBlurCannyEdgeDetector : BaseUsingCopyPartialFilter {
+    /// <summary>
+    /// Optimized in-place Canny edge detector with built-in 3x3 separable Gaussian blur.
+    /// Mirrors the behavior of Accord's CannyEdgeDetector but reduces allocations
+    /// and expensive math on the hot path.
+    /// </summary>
+    public class CannyEdgeDetector : BaseUsingCopyPartialFilter {
         private byte lowThreshold = 20;
         private byte highThreshold = 100;
 
-        // private format translation dictionary
+        // format translation dictionary
         private Dictionary<PixelFormat, PixelFormat> formatTranslations = new Dictionary<PixelFormat, PixelFormat>();
 
-        /// <summary>
-        /// Format translations dictionary.
-        /// </summary>
         public override Dictionary<PixelFormat, PixelFormat> FormatTranslations => formatTranslations;
 
-        /// <summary>
-        /// Low threshold.
-        /// </summary>
-        ///
-        /// <remarks><para>Low threshold value used for hysteresis
-        /// (see  <a href="http://www.pages.drexel.edu/~weg22/can_tut.html">tutorial</a>
-        /// for more information).</para>
-        ///
-        /// <para>Default value is set to <b>20</b>.</para>
-        /// </remarks>
-        ///
         public byte LowThreshold {
             get => lowThreshold;
             set => lowThreshold = value;
         }
 
-        /// <summary>
-        /// High threshold.
-        /// </summary>
-        ///
-        /// <remarks><para>High threshold value used for hysteresis
-        /// (see  <a href="http://www.pages.drexel.edu/~weg22/can_tut.html">tutorial</a>
-        /// for more information).</para>
-        ///
-        /// <para>Default value is set to <b>100</b>.</para>
-        /// </remarks>
-        ///
         public byte HighThreshold {
             get => highThreshold;
             set => highThreshold = value;
         }
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="CannyEdgeDetector"/> class.
-        /// </summary>
-        ///
-        public NoBlurCannyEdgeDetector() {
-            // initialize format translation dictionary
+        // Kept for compatibility; fixed 3x3 kernel.
+        public int GaussianSize {
+            get => 3;
+            set { /* ignore to preserve fixed kernel */ }
+        }
+
+        public CannyEdgeDetector() {
             formatTranslations[PixelFormat.Format8bppIndexed] = PixelFormat.Format8bppIndexed;
         }
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="CannyEdgeDetector"/> class.
-        /// </summary>
-        ///
-        /// <param name="lowThreshold">Low threshold.</param>
-        /// <param name="highThreshold">High threshold.</param>
-        ///
-        public NoBlurCannyEdgeDetector(byte lowThreshold, byte highThreshold) : this() {
+        public CannyEdgeDetector(byte lowThreshold, byte highThreshold) : this() {
             this.lowThreshold = lowThreshold;
             this.highThreshold = highThreshold;
         }
 
-        /// <summary>
-        /// Process the filter on the specified image.
-        /// </summary>
-        ///
-        /// <param name="source">Source image data.</param>
-        /// <param name="destination">Destination image data.</param>
-        /// <param name="rect">Image rectangle for processing by the filter.</param>
-        ///
         protected override unsafe void ProcessFilter(UnmanagedImage source, UnmanagedImage destination, Rectangle rect) {
             // processing start and stop X,Y positions
             int startX = rect.Left + 1;
@@ -112,31 +79,80 @@ namespace NINA.Image.ImageAnalysis {
             int heightFull = source.Height;
             int totalPixels = widthFull * heightFull;
 
-            // orientation and magnitude buffers (single-dimension, pooled)
+            byte[] srcBuffer = ArrayPool<byte>.Shared.Rent(totalPixels);
+            int[] tempBlur = ArrayPool<int>.Shared.Rent(totalPixels);
+            byte[] blurBuffer = ArrayPool<byte>.Shared.Rent(totalPixels);
             byte[] orientBuffer = ArrayPool<byte>.Shared.Rent(totalPixels);
             int[] magBuffer = ArrayPool<int>.Shared.Rent(totalPixels);
 
             int maxGradient = 1;
 
             try {
-                // do the job
+                // copy source into contiguous buffer (ignore stride padding)
                 byte* srcBase = (byte*)source.ImageData.ToPointer();
+                for (int y = 0; y < heightFull; y++) {
+                    Marshal.Copy(new IntPtr(srcBase + y * srcStride), srcBuffer, y * widthFull, widthFull);
+                }
+
+                // STEP 0: 3x3 Gaussian blur (separable: horizontal then vertical)
+                for (int y = 0; y < heightFull; y++) {
+                    int row = y * widthFull;
+                    int left = srcBuffer[row];
+                    int center = srcBuffer[row];
+                    int right = widthFull > 1 ? srcBuffer[row + 1] : center;
+                    tempBlur[row] = left + (center << 1) + right;
+                    for (int x = 1; x < widthFull - 1; x++) {
+                        left = srcBuffer[row + x - 1];
+                        center = srcBuffer[row + x];
+                        right = srcBuffer[row + x + 1];
+                        tempBlur[row + x] = left + (center << 1) + right;
+                    }
+                    if (widthFull > 1) {
+                        left = srcBuffer[row + widthFull - 2];
+                        center = srcBuffer[row + widthFull - 1];
+                        right = center;
+                        tempBlur[row + widthFull - 1] = left + (center << 1) + right;
+                    }
+                }
+
+                for (int x = 0; x < widthFull; x++) {
+                    int top = tempBlur[x];
+                    int center = tempBlur[x];
+                    int bottom = heightFull > 1 ? tempBlur[widthFull + x] : center;
+                    blurBuffer[x] = (byte)((top + (center << 1) + bottom + 8) >> 4);
+                    for (int y = 1; y < heightFull - 1; y++) {
+                        int idx = y * widthFull + x;
+                        top = tempBlur[idx - widthFull];
+                        center = tempBlur[idx];
+                        bottom = tempBlur[idx + widthFull];
+                        blurBuffer[idx] = (byte)((top + (center << 1) + bottom + 8) >> 4);
+                    }
+                    if (heightFull > 1) {
+                        int idx = (heightFull - 1) * widthFull + x;
+                        top = tempBlur[idx - widthFull];
+                        center = tempBlur[idx];
+                        bottom = center;
+                        blurBuffer[idx] = (byte)((top + (center << 1) + bottom + 8) >> 4);
+                    }
+                }
 
                 // STEP 1 - calculate magnitude (L1) and quantized orientation (parallel per row)
                 Parallel.For(startY, stopY, () => 0, (y, state, localMax) => {
-                    byte* rowPtr = srcBase + y * srcStride + startX;
                     int rowBase = y * widthFull;
-
-                    for (int x = startX; x < stopX; x++, rowPtr++) {
+                    for (int x = startX; x < stopX; x++) {
                         int idx = rowBase + x;
 
-                        int gx = rowPtr[-srcStride + 1] + rowPtr[srcStride + 1]
-                               - rowPtr[-srcStride - 1] - rowPtr[srcStride - 1]
-                               + 2 * (rowPtr[1] - rowPtr[-1]);
+                        int a = blurBuffer[idx - widthFull - 1];
+                        int b = blurBuffer[idx - widthFull];
+                        int c = blurBuffer[idx - widthFull + 1];
+                        int d = blurBuffer[idx - 1];
+                        int f = blurBuffer[idx + 1];
+                        int g = blurBuffer[idx + widthFull - 1];
+                        int h = blurBuffer[idx + widthFull];
+                        int i = blurBuffer[idx + widthFull + 1];
 
-                        int gy = rowPtr[-srcStride - 1] + rowPtr[-srcStride + 1]
-                               - rowPtr[srcStride - 1] - rowPtr[srcStride + 1]
-                               + 2 * (rowPtr[-srcStride] - rowPtr[srcStride]);
+                        int gx = (c + (f << 1) + i) - (a + (d << 1) + g);
+                        int gy = (g + (h << 1) + i) - (a + (b << 1) + c);
 
                         int ax = Math.Abs(gx);
                         int ay = Math.Abs(gy);
@@ -221,33 +237,36 @@ namespace NINA.Image.ImageAnalysis {
                 });
 
                 // STEP 3 - hysteresis
-                dst = dstBase + dstStride * startY + startX;
+                byte* dstHyst = dstBase + dstStride * startY + startX;
 
                 for (int y = startY; y < stopY; y++) {
-                    for (int x = startX; x < stopX; x++, dst++) {
-                        if (*dst < highThreshold) {
-                            if (*dst < lowThreshold) {
-                                *dst = 0;
+                    for (int x = startX; x < stopX; x++, dstHyst++) {
+                        if (*dstHyst < highThreshold) {
+                            if (*dstHyst < lowThreshold) {
+                                *dstHyst = 0;
                             } else {
-                                if ((dst[-1] < highThreshold) &&
-                                    (dst[1] < highThreshold) &&
-                                    (dst[-dstStride - 1] < highThreshold) &&
-                                    (dst[-dstStride] < highThreshold) &&
-                                    (dst[-dstStride + 1] < highThreshold) &&
-                                    (dst[dstStride - 1] < highThreshold) &&
-                                    (dst[dstStride] < highThreshold) &&
-                                    (dst[dstStride + 1] < highThreshold)) {
-                                    *dst = 0;
+                                if ((dstHyst[-1] < highThreshold) &&
+                                    (dstHyst[1] < highThreshold) &&
+                                    (dstHyst[-dstStride - 1] < highThreshold) &&
+                                    (dstHyst[-dstStride] < highThreshold) &&
+                                    (dstHyst[-dstStride + 1] < highThreshold) &&
+                                    (dstHyst[dstStride - 1] < highThreshold) &&
+                                    (dstHyst[dstStride] < highThreshold) &&
+                                    (dstHyst[dstStride + 1] < highThreshold)) {
+                                    *dstHyst = 0;
                                 }
                             }
                         }
                     }
-                    dst += dstOffset;
+                    dstHyst += dstOffset;
                 }
 
                 // STEP 4 - draw black rectangle to remove those pixels, which were not processed
                 Drawing.Rectangle(destination, rect, Color.Black);
             } finally {
+                ArrayPool<byte>.Shared.Return(srcBuffer);
+                ArrayPool<int>.Shared.Return(tempBlur);
+                ArrayPool<byte>.Shared.Return(blurBuffer);
                 ArrayPool<byte>.Shared.Return(orientBuffer);
                 ArrayPool<int>.Shared.Return(magBuffer);
             }

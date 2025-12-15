@@ -1,7 +1,7 @@
-#region "copyright"
+﻿#region "copyright"
 
 /*
-    Copyright � 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
+    Copyright © 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
 
     This file is part of N.I.N.A. - Nighttime Imaging 'N' Astronomy.
 
@@ -60,7 +60,7 @@ namespace NINA.Image.ImageData {
             MetaData = metaData;
             Properties = new ImageProperties(width: width, height: height, bitDepth: bitDepth, isBayered: isBayered, gain: metaData.Camera.Gain, offset: metaData.Camera.Offset);
             StarDetectionAnalysis = starDetection.CreateAnalysis();
-            Statistics = new Nito.AsyncEx.AsyncLazy<IImageStatistics>(async () => await Task.Run(() => ImageStatistics.Create(this)));
+            Statistics = new Nito.AsyncEx.AsyncLazy<IImageStatistics>(async () => await Task.Run(() => FastImageStatistics.Create(this)));
             this.profileService = profileService;
             this.starDetection = starDetection;
             this.starAnnotator = starAnnotator;

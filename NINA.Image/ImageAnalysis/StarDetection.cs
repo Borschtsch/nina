@@ -12,14 +12,18 @@
 
 #endregion "copyright"
 
-using Accord.Imaging;
-using Accord.Imaging.Filters;
-using Accord.Math.Geometry;
 using NINA.Core.Enum;
 using NINA.Core.Model;
 using NINA.Core.Utility;
 using NINA.Image.ImageData;
 using NINA.Image.Interfaces;
+using Accord.Imaging;
+using Accord.Math.Geometry;
+using Accord.Imaging.Filters;
+using System.Buffers;
+using LocalGrayscale = NINA.Image.ImageAnalysis.Filters.Grayscale;
+using LocalSISThreshold = NINA.Image.ImageAnalysis.Filters.SISThreshold;
+using LocalBinaryDilation3x3 = NINA.Image.ImageAnalysis.Filters.BinaryDilation3x3;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -109,7 +113,7 @@ namespace NINA.Image.ImageAnalysis {
             state._maxStarSize = (int)Math.Ceiling(150 * state._resizefactor);
             if (pf == PixelFormats.Rgb48) {
                 using (var source = ImageUtility.BitmapFromSource(state._originalBitmapSource, System.Drawing.Imaging.PixelFormat.Format48bppRgb)) {
-                    using (var img = new Grayscale(0.2125, 0.7154, 0.0721).Apply(source)) {
+                    using (var img = new LocalGrayscale(0.2125, 0.7154, 0.0721).Apply(source)) {
                         state._originalBitmapSource = ImageUtility.ConvertBitmap(img, System.Windows.Media.PixelFormats.Gray16);
                         state._originalBitmapSource.Freeze();
                     }
@@ -149,7 +153,9 @@ namespace NINA.Image.ImageAnalysis {
                         allSum += value;
                         if (InsideCircle(data.PosX, data.PosY, this.Position.X, this.Position.Y, outerRadius)) {
                             sum += value;
-                            sumDist += value * Math.Sqrt(Math.Pow(data.PosX - centerX, 2.0d) + Math.Pow(data.PosY - centerY, 2.0d));
+                            double dx = data.PosX - centerX;
+                            double dy = data.PosY - centerY;
+                            sumDist += value * Math.Sqrt(dx*dx + dy*dy);
                             sumValX += (data.PosX - Rectangle.X) * value;
                             sumValY += (data.PosY - Rectangle.Y) * value;
                         }
@@ -173,7 +179,9 @@ namespace NINA.Image.ImageAnalysis {
             }
 
             internal bool InsideCircle(double x, double y, double centerX, double centerY, double radius) {
-                return (Math.Pow(x - centerX, 2) + Math.Pow(y - centerY, 2) <= Math.Pow(radius, 2));
+                double dx = x - centerX;
+                double dy = y - centerY;
+                return (dx*dx + dy*dy <= radius*radius);
             }
 
             public DetectedStar ToDetectedStar() {
@@ -188,7 +196,8 @@ namespace NINA.Image.ImageAnalysis {
             }
         }
 
-        public record PixelData (int PosX, int PosY, double Value);
+        // Value-type to keep per-pixel metadata stack/array allocated when pooling.
+        public readonly record struct PixelData (int PosX, int PosY, double Value);
 
         public async Task<StarDetectionResult> Detect(IRenderedImage image, PixelFormat pf, StarDetectionParams p, IProgress<ApplicationStatus> progress, CancellationToken token) {
             var result = new StarDetectionResult();
@@ -198,6 +207,7 @@ namespace NINA.Image.ImageAnalysis {
                     progress?.Report(new ApplicationStatus() { Status = "Preparing image for star detection" });
 
                     var state = GetInitialState(image, pf, p);
+
                     bitmapToAnalyze = ImageUtility.Convert16BppTo8Bpp(state._originalBitmapSource);
 
                     token.ThrowIfCancellationRequested();
@@ -209,6 +219,8 @@ namespace NINA.Image.ImageAnalysis {
 
                     /* Resize to speed up manipulation */
                     bitmapToAnalyze = DetectionUtility.ResizeForDetection(bitmapToAnalyze, _maxWidth, state._resizefactor);
+
+                    token.ThrowIfCancellationRequested();
 
                     /* prepare image for structure detection */
                     PrepareForStructureDetection(bitmapToAnalyze, p, token);
@@ -303,32 +315,40 @@ namespace NINA.Image.ImageAnalysis {
                     }
 
                     /* get pixeldata */
-                    double starPixelSum = 0;
-                    int starPixelCount = 0;
-                    double largeRectPixelSum = 0;
-                    double largeRectPixelSumSquares = 0;
-                    List<ushort> innerStarPixelValues = new List<ushort>();
+            double starPixelSum = 0;
+            int starPixelCount = 0;
+            double largeRectPixelSum = 0;
+            double largeRectPixelSumSquares = 0;
+            // Pool buffers to reduce GC churn; same math/ordering as before (bit-identical).
+            int sampleCapacity = Math.Max(1, rect.Width * rect.Height);
+            PixelData[] pixelPool = ArrayPool<PixelData>.Shared.Rent(sampleCapacity);
+            int pixelCount = 0;
+            ushort[] innerPool = ArrayPool<ushort>.Shared.Rent(sampleCapacity);
+            int innerCount = 0;
 
-                    var pixelDataList = new List<PixelData>();
-                    for (int x = largeRect.X; x < largeRect.X + largeRect.Width; x++) {
-                        for (int y = largeRect.Y; y < largeRect.Y + largeRect.Height; y++) {
-                            var pixelValue = state._iarr.FlatArray[x + (state.imageProperties.Width * y)];
-                            if (x >= s.Rectangle.X && x < s.Rectangle.X + s.Rectangle.Width && y >= s.Rectangle.Y && y < s.Rectangle.Y + s.Rectangle.Height) { //We're in the small rectangle directly surrounding the star
-                                if (s.InsideCircle(x, y, s.Position.X, s.Position.Y, s.Radius)) { // We're in the inner sanctum of the star
-                                    starPixelSum += pixelValue;
-                                    starPixelCount++;
-                                    innerStarPixelValues.Add(pixelValue);
-                                    s.MaxPixelValue = Math.Max(s.MaxPixelValue, pixelValue);
+                    try {
+                        for (int x = largeRect.X; x < largeRect.X + largeRect.Width; x++) {
+                            int baseIdx = x + (state.imageProperties.Width * largeRect.Y);
+                            for (int y = largeRect.Y; y < largeRect.Y + largeRect.Height; y++, baseIdx += state.imageProperties.Width) {
+                                var pixelValue = state._iarr.FlatArray[baseIdx];
+                                if (x >= s.Rectangle.X && x < s.Rectangle.X + s.Rectangle.Width && y >= s.Rectangle.Y && y < s.Rectangle.Y + s.Rectangle.Height) { //We're in the small rectangle directly surrounding the star
+                                    if (s.InsideCircle(x, y, s.Position.X, s.Position.Y, s.Radius)) { // We're in the inner sanctum of the star
+                                        starPixelSum += pixelValue;
+                                        starPixelCount++;
+                                        if (innerCount < sampleCapacity) {
+                                            innerPool[innerCount++] = pixelValue;
+                                        }
+                                        s.MaxPixelValue = Math.Max(s.MaxPixelValue, pixelValue);
+                                    }
+                                    if (pixelCount < sampleCapacity) {
+                                        pixelPool[pixelCount++] = new PixelData(PosX: x, PosY: y, Value: pixelValue);
+                                    }
+                                } else { //We're in the larger surrounding holed rectangle, providing local background
+                                    largeRectPixelSum += pixelValue;
+                                    largeRectPixelSumSquares += pixelValue * pixelValue;
                                 }
-                                ushort value = pixelValue;
-                                var pd = new PixelData(PosX: x, PosY: y, Value: value);
-                                pixelDataList.Add(pd);
-                            } else { //We're in the larger surrounding holed rectangle, providing local background
-                                largeRectPixelSum += pixelValue;
-                                largeRectPixelSumSquares += pixelValue * pixelValue;
                             }
                         }
-                    }
 
                     s.MeanBrightness = starPixelSum / (double)starPixelCount;
                     double largeRectPixelCount = largeRect.Height * largeRect.Width - rect.Height * rect.Width;
@@ -337,15 +357,33 @@ namespace NINA.Image.ImageAnalysis {
                     double largeRectStdev = Math.Sqrt((largeRectPixelSumSquares - largeRectPixelCount * largeRectMean * largeRectMean) / largeRectPixelCount);
                     int minimumNumberOfPixels = (int)Math.Ceiling(Math.Max(state._originalBitmapSource.PixelWidth, state._originalBitmapSource.PixelHeight) / 1000d);
 
-                    if (s.MeanBrightness >= largeRectMean + Math.Min(0.1 * largeRectMean, largeRectStdev) && innerStarPixelValues.Count(pv => pv > largeRectMean + 1.5 * largeRectStdev) > minimumNumberOfPixels) {
+                        int brightCount = 0;
+                        double brightThreshold = largeRectMean + 1.5 * largeRectStdev; // same threshold as before
+                        for (int i = 0; i < innerCount; i++) {
+                            if (innerPool[i] > brightThreshold) brightCount++;
+                        }
+
+                        // Rehydrate pooled struct data into the expected list type (behavior unchanged).
+                        var pixelDataList = new List<PixelData>(pixelCount);
+                        for (int i = 0; i < pixelCount; i++) {
+                            pixelDataList.Add(pixelPool[i]);
+                        }
+
+                        if (s.MeanBrightness >= largeRectMean + Math.Min(0.1 * largeRectMean, largeRectStdev) && brightCount > minimumNumberOfPixels) {
                         s.Calculate(pixelDataList);
                         //It's a local maximum, and has enough bright pixels, so likely to be a star.                        
-                        if (s.Position.X > (s.Rectangle.X + 1) && s.Position.Y > (s.Rectangle.Y + 1) && s.Position.X < (s.Position.X + s.Rectangle.Width - 2) && s.Position.Y < (s.Position.Y + s.Rectangle.Height - 2)) {
+                        if (s.Position.X > (s.Rectangle.X + 1) && s.Position.Y > (s.Rectangle.Y + 1) &&
+                            s.Position.X < (s.Rectangle.X + s.Rectangle.Width - 2) &&
+                            s.Position.Y < (s.Rectangle.Y + s.Rectangle.Height - 2)) {
                             // Only add star when centroid is not touching the rectangle edges
                             sumRadius += s.Radius;
                             sumSquares += s.Radius * s.Radius;
                             starList.Add(s);
                         }
+                    }
+                    } finally {
+                        ArrayPool<PixelData>.Shared.Return(pixelPool);
+                        ArrayPool<ushort>.Shared.Return(innerPool);
                     }
                 }
 
@@ -413,7 +451,7 @@ namespace NINA.Image.ImageAnalysis {
             using (MyStopWatch.Measure()) {
                 using (MyStopWatch.Measure("PrepareForStructureDetection - CannyEdge")) {
                     if (p.NoiseReduction == NoiseReductionEnum.None || p.NoiseReduction == NoiseReductionEnum.Median) {
-                        //Still need to apply Gaussian blur, using normal Canny
+                        //Still need to apply Gaussian blur, using normal Canny. Thresholds remain tuned for legacy behavior.
                         new CannyEdgeDetector(10, 80).ApplyInPlace(bmp);
                     } else {
                         //Gaussian blur already applied, using no-blur Canny
@@ -423,12 +461,12 @@ namespace NINA.Image.ImageAnalysis {
 
                 token.ThrowIfCancellationRequested();
                 using (MyStopWatch.Measure("PrepareForStructureDetection - SISThreshold")) {
-                    new SISThreshold().ApplyInPlace(bmp);
+                    new LocalSISThreshold().ApplyInPlace(bmp);
                 }
 
                 token.ThrowIfCancellationRequested();
                 using (MyStopWatch.Measure("PrepareForStructureDetection - BinaryDilation3x3")) {
-                    new BinaryDilation3x3().ApplyInPlace(bmp);
+                    new LocalBinaryDilation3x3().ApplyInPlace(bmp);
                 }
                 token.ThrowIfCancellationRequested();
             }
@@ -473,4 +511,5 @@ namespace NINA.Image.ImageAnalysis {
             analysis.StarList = result.StarList;
         }
     }
+
 }

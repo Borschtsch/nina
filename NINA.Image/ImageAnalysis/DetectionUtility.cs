@@ -12,10 +12,11 @@
 
 #endregion "copyright"
 
-using Accord.Imaging.Filters;
 using NINA.Core.Utility;
+using NINA.Image.ImageAnalysis.Filters;
 using System;
 using System.Drawing;
+using System.Collections.Concurrent;
 
 namespace NINA.Image.ImageAnalysis {
 
@@ -52,9 +53,13 @@ namespace NINA.Image.ImageAnalysis {
         public static Bitmap ResizeForDetection(Bitmap image, int maxWidth, double resizeFactor) {
             using (MyStopWatch.Measure()) {
                 if (image.Width > maxWidth) {
-                    var bmp = new ResizeBicubic((int)Math.Floor(image.Width * resizeFactor), (int)Math.Floor(image.Height * resizeFactor)).Apply(image);
+                    int targetWidth = Math.Max(1, (int)Math.Floor(image.Width * resizeFactor));
+                    int targetHeight = Math.Max(1, (int)Math.Floor(image.Height * resizeFactor));
+
+                    // Use local bicubic to preserve legacy alignment/HFR characteristics while avoiding external deps.
+                    var resized = ResizeBicubicCached.Resize(image, targetWidth, targetHeight);
                     image.Dispose();
-                    return bmp;
+                    return resized;
                 }
                 return image;
             }

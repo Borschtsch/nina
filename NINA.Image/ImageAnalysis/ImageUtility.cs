@@ -1,7 +1,7 @@
-#region "copyright"
+﻿#region "copyright"
 
 /*
-    Copyright � 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
+    Copyright пїЅ 2016 - 2024 Stefan Berg <isbeorn86+NINA@googlemail.com> and the N.I.N.A. contributors
 
     This file is part of N.I.N.A. - Nighttime Imaging 'N' Astronomy.
 
@@ -16,19 +16,24 @@ using Accord.Imaging;
 using NINA.Core.Enum;
 using NINA.Core.Locale;
 using NINA.Core.Utility;
-using NINA.Image.ImageData;
 using NINA.Image.Interfaces;
+using NINA.Image.ImageData;
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
 namespace NINA.Image.ImageAnalysis {
 
     public class ImageUtility {
+
+        // Per-thread scratch buffer to avoid ArrayPool rent/return churn in 16->8 conversion.
+        private static readonly System.Threading.ThreadLocal<byte[]> _convert16To8Buffer = new System.Threading.ThreadLocal<byte[]>();
 
         public static ColorRemappingGeneral GetColorRemappingFilter(
             IImageStatistics statistics,
@@ -168,6 +173,55 @@ namespace NINA.Image.ImageAnalysis {
             return bitmapSource;
         }
 
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        private static BitmapSource CreateBitmapSourceFast(Bitmap bitmap, System.Windows.Media.PixelFormat pf) {
+            _ = pf; // format already defined by bitmap; keep parameter for parity with ConvertBitmap
+            var hBitmap = bitmap.GetHbitmap();
+            try {
+                var source = Imaging.CreateBitmapSourceFromHBitmap(
+                    hBitmap,
+                    IntPtr.Zero,
+                    Int32Rect.Empty,
+                    BitmapSizeOptions.FromEmptyOptions());
+                source.Freeze();
+                return source;
+            } finally {
+                DeleteObject(hBitmap);
+            }
+        }
+
+        private static void ApplyStretchUnlinkedInPlace(
+            ushort[] buffer,
+            int width,
+            int height,
+            IImageStatistics redStats,
+            IImageStatistics greenStats,
+            IImageStatistics blueStats,
+            double factor,
+            double blackClipping) {
+
+            if (buffer == null || buffer.Length < width * height * 3)
+                return;
+
+            ushort[] mapR = GetStretchMap(redStats, factor, blackClipping);
+            ushort[] mapG = GetStretchMap(greenStats, factor, blackClipping);
+            ushort[] mapB = GetStretchMap(blueStats, factor, blackClipping);
+
+            int len = width * height;
+            int idx = 0;
+            for (int i = 0; i < len; i++) {
+                ushort r = buffer[idx];
+                ushort g = buffer[idx + 1];
+                ushort b = buffer[idx + 2];
+                buffer[idx] = mapR[r];
+                buffer[idx + 1] = mapG[g];
+                buffer[idx + 2] = mapB[b];
+                idx += 3;
+            }
+        }
+
         public static Bitmap BitmapFromSource(BitmapSource source) {
             return BitmapFromSource(source, System.Drawing.Imaging.PixelFormat.Format16bppGrayScale);
         }
@@ -191,10 +245,65 @@ namespace NINA.Image.ImageAnalysis {
         }
 
         public static Bitmap Convert16BppTo8Bpp(BitmapSource source) {
-            using(MyStopWatch.Measure()) { 
-                using (var bmp = BitmapFromSource(source)) {
-                    return Accord.Imaging.Image.Convert16bppTo8bpp(bmp);
+            using (MyStopWatch.Measure()) {
+                // Fast path for 16bpp gray -> 8bpp indexed. Bit-exact: we keep the high byte of each ushort.
+                int width = source.PixelWidth;
+                int height = source.PixelHeight;
+                int srcStride = width * 2;
+                int bufferSize = srcStride * height;
+
+                // Reuse thread-local buffer; grow if the current image does not fit.
+                byte[] srcBuffer = _convert16To8Buffer.Value;
+                if (srcBuffer == null || srcBuffer.Length < bufferSize) {
+                    srcBuffer = new byte[bufferSize];
+                    _convert16To8Buffer.Value = srcBuffer;
                 }
+                // Copy WPF source into contiguous byte buffer (little-endian ushort layout).
+                source.CopyPixels(new Int32Rect(0, 0, width, height), srcBuffer, srcStride, 0);
+
+                var bmp = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format8bppIndexed);
+                bmp.Palette = GetGrayScalePalette();
+
+                var data = bmp.LockBits(
+                    new Rectangle(System.Drawing.Point.Empty, bmp.Size),
+                    ImageLockMode.WriteOnly,
+                    System.Drawing.Imaging.PixelFormat.Format8bppIndexed);
+
+                try {
+                    unsafe {
+                        byte* dstBase = (byte*)data.Scan0;
+                        int dstStride = data.Stride;
+
+                        fixed (byte* srcBase = srcBuffer) {
+                            for (int y = 0; y < height; y++) {
+                                byte* src = srcBase + y * srcStride;
+                                byte* dst = dstBase + y * dstStride;
+
+                                int x = 0;
+                                int limit = width - 7; // unroll in groups of 8 pixels
+                                while (x <= limit) {
+                                    // Unroll 8 pixels: copy high byte of each ushort (bit-precise path).
+                                    dst[x + 0] = src[(x + 0) * 2 + 1];
+                                    dst[x + 1] = src[(x + 1) * 2 + 1];
+                                    dst[x + 2] = src[(x + 2) * 2 + 1];
+                                    dst[x + 3] = src[(x + 3) * 2 + 1];
+                                    dst[x + 4] = src[(x + 4) * 2 + 1];
+                                    dst[x + 5] = src[(x + 5) * 2 + 1];
+                                    dst[x + 6] = src[(x + 6) * 2 + 1];
+                                    dst[x + 7] = src[(x + 7) * 2 + 1];
+                                    x += 8;
+                                }
+                                for (; x < width; x++) {
+                                    dst[x] = src[(x << 1) + 1];
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    bmp.UnlockBits(data);
+                }
+
+                return bmp;
             }
         }
 
@@ -223,9 +332,78 @@ namespace NINA.Image.ImageAnalysis {
                 if (pf != System.Drawing.Imaging.PixelFormat.Format16bppGrayScale) {
                     throw new NotSupportedException();
                 }
-                using (var bmp = BitmapFromSource(source, System.Drawing.Imaging.PixelFormat.Format16bppGrayScale)) {
-                    return Debayer(bmp, saveColorChannels, saveLumChannel, bayerPattern);
+
+                int width = source.PixelWidth;
+                int height = source.PixelHeight;
+
+                // Acquire unmanaged buffers and the reusable filter instance up front so we can time every phase explicitly.
+                var resources = DebayerBufferPool.Instance.Acquire(width, height, saveColorChannels, saveLumChannel, bayerPattern);
+                var filter = resources.Filter;
+
+                // Measure the copy from the WPF source into the unmanaged input buffer to confirm how much of the Debayer time is pure memory traffic.
+                using (MyStopWatch.Measure($"{nameof(Debayer)}_CopyInput")) {
+                    var rect = new Int32Rect(0, 0, width, height);
+                    source.CopyPixels(rect, resources.InputPtr, resources.InputSizeBytes, resources.InputStride);
                 }
+
+                // Time the actual filter execution (includes demosaic and optional channel extraction) separately from wrapping and copies.
+                using (MyStopWatch.Measure($"{nameof(Debayer)}_ApplyFilter")) {
+                    filter.ApplyInto(resources.InputImage, resources.OutputImage);
+                }
+
+                BitmapSource imageSource;
+                // Track the cost of turning the unmanaged RGB buffer into a frozen BitmapSource (WPF copies here).
+                using (MyStopWatch.Measure($"{nameof(Debayer)}_WrapBitmap")) {
+                    imageSource = BitmapSource.Create(
+                        width,
+                        height,
+                        96,
+                        96,
+                        PixelFormats.Rgb48,
+                        null,
+                        resources.OutputPtr,
+                        resources.OutputSizeBytes,
+                        resources.OutputStride);
+                    imageSource.Freeze();
+                }
+
+                // Clone the optional L/R/G/B planes because the pooled filter instance may be reused on the next call.
+                LRGBArrays dataCopy = null;
+                var arrays = filter.LRGBArrays;
+                if (arrays != null) {
+                    ushort[] lum = Array.Empty<ushort>();
+                    ushort[] r = Array.Empty<ushort>();
+                    ushort[] g = Array.Empty<ushort>();
+                    ushort[] b = Array.Empty<ushort>();
+
+                    if (saveLumChannel && arrays.Lum != null && arrays.Lum.Length > 0) {
+                        lum = new ushort[arrays.Lum.Length];
+                        Array.Copy(arrays.Lum, lum, lum.Length);
+                    }
+                    if (saveColorChannels) {
+                        if (arrays.Red != null && arrays.Red.Length > 0) {
+                            r = new ushort[arrays.Red.Length];
+                            Array.Copy(arrays.Red, r, r.Length);
+                        }
+                        if (arrays.Green != null && arrays.Green.Length > 0) {
+                            g = new ushort[arrays.Green.Length];
+                            Array.Copy(arrays.Green, g, g.Length);
+                        }
+                        if (arrays.Blue != null && arrays.Blue.Length > 0) {
+                            b = new ushort[arrays.Blue.Length];
+                            Array.Copy(arrays.Blue, b, b.Length);
+                        }
+                    }
+
+                    if (lum.Length > 0 || r.Length > 0 || g.Length > 0 || b.Length > 0) {
+                        dataCopy = new LRGBArrays(lum, r, g, b);
+                    }
+                }
+
+                return new DebayeredImageData {
+                    ImageSource = imageSource,
+                    Data = dataCopy
+                };
             }
         }
 
@@ -275,25 +453,32 @@ namespace NINA.Image.ImageAnalysis {
                 }
 
                 DebayeredImageData debayered = new DebayeredImageData();
-                debayered.ImageSource = ConvertBitmap(filter.Apply(bmp), PixelFormats.Rgb48);
-                debayered.ImageSource.Freeze();
+                using (var outBmp = filter.Apply(bmp)) {
+                    debayered.ImageSource = ConvertBitmap(outBmp, PixelFormats.Rgb48);
+                    debayered.ImageSource.Freeze();
+                }
                 debayered.Data = filter.LRGBArrays;
                 return debayered;
             }
         }
 
+        private static readonly object _paletteLock = new object();
+        private static ColorPalette _grayPalette;
+
         public static ColorPalette GetGrayScalePalette() {
-            using (var bmp = new Bitmap(1, 1, System.Drawing.Imaging.PixelFormat.Format8bppIndexed)) {
-                ColorPalette monoPalette = bmp.Palette;
-
-                System.Drawing.Color[] entries = monoPalette.Entries;
-
-                for (int i = 0; i < 256; i++) {
-                    entries[i] = System.Drawing.Color.FromArgb(i, i, i);
+            if (_grayPalette != null) return _grayPalette;
+            lock (_paletteLock) {
+                if (_grayPalette != null) return _grayPalette;
+                using (var bmp = new Bitmap(1, 1, System.Drawing.Imaging.PixelFormat.Format8bppIndexed)) {
+                    var monoPalette = bmp.Palette;
+                    var entries = monoPalette.Entries;
+                    for (int i = 0; i < 256; i++) {
+                        entries[i] = System.Drawing.Color.FromArgb(i, i, i);
+                    }
+                    _grayPalette = monoPalette;
                 }
-
-                return monoPalette;
             }
+            return _grayPalette;
         }
 
         public static Task<BitmapSource> Stretch(IRenderedImage image, double factor, double blackClipping) {
@@ -318,12 +503,10 @@ namespace NINA.Image.ImageAnalysis {
                 if (data.OriginalImage.Format != PixelFormats.Rgb48) {
                     throw new NotSupportedException();
                 } else {
-                    var asyncR = Task.Run(() => ImageData.ImageStatistics.Create(data.RawImageData.Properties, data.DebayeredData.Red));
-                    var asyncG = Task.Run(() => ImageData.ImageStatistics.Create(data.RawImageData.Properties, data.DebayeredData.Green));
-                    var asyncB = Task.Run(() => ImageData.ImageStatistics.Create(data.RawImageData.Properties, data.DebayeredData.Blue));
-                    await Task.WhenAll(asyncR, asyncG, asyncB);
+                    var rgbStats = await Task.Run(() => FastImageStatistics.CreateRgb(data.RawImageData.Properties, data.DebayeredData));
+
                     using (var img = ImageUtility.BitmapFromSource(data.OriginalImage, System.Drawing.Imaging.PixelFormat.Format48bppRgb)) {
-                        return StretchUnlinked(asyncR.Result, asyncG.Result, asyncB.Result, img, data.OriginalImage.Format, factor, blackClipping);
+                        return StretchUnlinked(rgbStats.Red, rgbStats.Green, rgbStats.Blue, img, data.OriginalImage.Format, factor, blackClipping);
                     }
                 }
             });
@@ -338,10 +521,9 @@ namespace NINA.Image.ImageAnalysis {
             double factor,
             double blackClipping) {
             using (MyStopWatch.Measure()) {
-                // Swap Red & Blue statistics due to differences in 48-bit Bitmap (RGB) & BitmapSource (BGR).
+                // Fallback to bitmap-based path if needed elsewhere.
                 var filter = ImageUtility.GetColorRemappingFilterUnlinked(blueStatistics, greenStatistics, redStatistics, factor, blackClipping, pf);
                 filter.ApplyInPlace(img);
-
                 var source = ImageUtility.ConvertBitmap(img, pf);
                 source.Freeze();
                 return source;
