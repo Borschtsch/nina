@@ -22,26 +22,22 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 namespace NINA.Image.ImageAnalysis {
-    public sealed class BayerFilter16bpp : BayerFilter {
 
-        public BayerFilter16bpp() {
-            FormatTranslations[
-                System.Drawing.Imaging.PixelFormat.Format16bppGrayScale] = System.Drawing.Imaging.PixelFormat.Format48bppRgb;
+    public class BayerFilter16bpp : BayerFilter {
+
+        public BayerFilter16bpp() : base() {
+            // initialize format translation dictionary
+            FormatTranslations[System.Drawing.Imaging.PixelFormat.Format16bppGrayScale] = System.Drawing.Imaging.PixelFormat.Format48bppRgb;
         }
 
         public bool SaveColorChannels { get; set; }
+
         public bool SaveLumChannel { get; set; }
 
         public LRGBArrays LRGBArrays { get; private set; }
 
         protected override unsafe void ProcessFilter(UnmanagedImage sourceData, UnmanagedImage destinationData) {
-            int width = sourceData.Width;
-            int height = sourceData.Height;
-
-            using (MyStopWatch.Measure("InitLRGBArrays")) {
-                int pixelCount = width * height;
-                InitLRGBArrays(pixelCount);
-            }
+            InitLRGBArrays(sourceData.Width * sourceData.Height);
 
             ushort* srcPtr = (ushort*)sourceData.ImageData.ToPointer();
             ushort* dstPtr = (ushort*)destinationData.ImageData.ToPointer();
@@ -52,15 +48,15 @@ namespace NINA.Image.ImageAnalysis {
 
             using (MyStopWatch.Measure("Demosaicing")) {
                 if (PerformDemosaicing) {
-                    Demosaic(srcPtr, dstPtr, width, height, srcStride, dstStride);
+                    Demosaic(srcPtr, dstPtr, sourceData.Width, sourceData.Height, srcStride, dstStride);
                 } else {
-                    CopyPatternToRgb(srcPtr, dstPtr, width, height, srcStride, dstStride);
+                    CopyPatternToRgb(srcPtr, dstPtr, sourceData.Width, sourceData.Height, srcStride, dstStride);
                 }
             }
 
             using (MyStopWatch.Measure("ExtractLrgba")) {
                 if (SaveColorChannels || SaveLumChannel) {
-                    ExtractLrgba(dstPtr, width, height, dstStride);
+                    ExtractLrgba(dstPtr, sourceData.Width, sourceData.Height, dstStride);
                 }
             }
         }
@@ -190,6 +186,15 @@ namespace NINA.Image.ImageAnalysis {
             Acc(ref col, ch, v);
         }
 
+        // Process a single interior row using a sliding 3x3 window built from three column accumulators.
+        // Text graphic (rows are top/mid/bot, columns are L/C/R at x-1/x/x+1):
+        //   rowTop:  a  b  c  d ...
+        //   rowMid:  e  f  g  h ...
+        //   rowBot:  i  j  k  l ...
+        //   cols:    L={a,e,i}  C={b,f,j}  R={c,g,k}
+        //   next x:  L<-C, C<-R, R<-{d,h,l}
+        // Why faster: only the new right column is recomputed per pixel (3 samples instead of 9),
+        // which reduces loads and pattern lookups while keeping the hot loop cache-friendly.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private unsafe void ProcessInnerRow(
             int y,
@@ -213,7 +218,9 @@ namespace NINA.Image.ImageAnalysis {
             // This keeps row alignment correct when GDI+ inserts padding for odd widths.
             ushort* dst = dstBase + (y * dstStride) + 3;
 
-            // Column accumulators for x-1, x, x+1
+            // Column accumulators for x-1, x, x+1.
+            // We reuse two columns each step (L<-C<-R) and recompute only the new right column at x+2.
+            // This reduces per-pixel work to 3 new samples and keeps the hot loop fast and cache-friendly.
             ColumnAccum colL = default, colC = default, colR = default, tmp = default;
 
             // Seed the sliding 3x3 window centered at x = 1 using columns 0, 1, 2
@@ -324,16 +331,8 @@ namespace NINA.Image.ImageAnalysis {
             }
         }
 
-        private unsafe void ExtractLrgba(ushort* dstPtr, int width, int height, int dstStride) {
-            // Exit early when no auxiliary arrays are requested.
-            // This keeps the main filter fast for image-only usage.
-            if (LRGBArrays == null)
-                return;
-
-            // Snapshot the flags once so row-level branches are stable during parallel execution.
-            // This keeps the control flow predictable while avoiding per-pixel conditionals.
-            bool saveColor = SaveColorChannels;
-            bool saveLum = SaveLumChannel;
+        private unsafe void ExtractLrgba(ushort* rgbSrcPtr, int width, int height, int rgbSrcStride) {
+            Debug.Assert(LRGBArrays != null);
 
             // Pin all arrays once so the GC cannot relocate them during parallel access.
             // The fixed block avoids per-row pinning and keeps pointer arithmetic safe.
@@ -348,10 +347,15 @@ namespace NINA.Image.ImageAnalysis {
                 IntPtr blueBase = (IntPtr)bluePtr;
                 IntPtr lumBase = (IntPtr)lumPtr;
 
+                // Snapshot the flags once so row-level branches are stable during parallel execution.
+                // This keeps the control flow predictable while avoiding per-pixel conditionals.
+                bool saveColor = SaveColorChannels;
+                bool saveLum = SaveLumChannel;
+
                 Parallel.For(0, height, y => {
-                    // Start from the beginning of the destination row using the padded stride.
+                    // Start from the beginning of the source RGB row using the padded stride.
                     // This keeps odd-width rows aligned with GDI+ padding rules.
-                    ushort* rowStart = dstPtr + (y * dstStride);
+                    ushort* rowStart = rgbSrcPtr + (y * rgbSrcStride);
 
                     // Compute the packed output offset once so array writes are contiguous.
                     // Each LRGBArrays plane is stored without padding between rows.
@@ -364,7 +368,7 @@ namespace NINA.Image.ImageAnalysis {
                         ushort* greenRow = (ushort*)greenBase + offset;
                         ushort* blueRow = (ushort*)blueBase + offset;
 
-                        // Walk the destination row and write the three color planes.
+                        // Walk the source RGB row and write the three color planes.
                         // The mapping preserves the legacy Red=B, Green=G, Blue=R layout.
                         ushort* src = rowStart;
                         for (int x = 0; x < width; x++) {
@@ -384,7 +388,7 @@ namespace NINA.Image.ImageAnalysis {
                         // This keeps the luminance buffer tightly packed and contiguous.
                         ushort* lumRow = (ushort*)lumBase + offset;
 
-                        // Walk the destination row and compute luminance only.
+                        // Walk the source RGB row and compute luminance only.
                         // The floating divide keeps luminance bit-exact with existing behavior.
                         ushort* src = rowStart;
                         for (int x = 0; x < width; x++) {
